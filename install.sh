@@ -33,7 +33,7 @@ ensure_tools() {
     info "Installing ipcalc..."
     apt-get install -y ipcalc
   fi
-  systemctl --version >/dev/null || { err "systemd required."; exit 1; }
+  systemctl --version >/dev/null || { err "systemd is required."; exit 1; }
 }
 
 yes_no() {
@@ -124,25 +124,25 @@ list_instances() {
 
 # ========= Actions =========
 install_iran_multi() {
-  bold "نصب روی سرور ایران (چند سرور خارج)"
+  bold "Install on IRAN server (connect to multiple FOREIGN servers)"
   local wan mtu lp n
   wan="$(default_iface)"; wan="$(ask 'WAN interface' "$wan")"
-  lp="$(ask 'Public IP این سرور (ایران)' "$(curl -fsSL ifconfig.me 2>/dev/null || echo)")"
-  while ! valid_ip "$lp"; do lp="$(ask 'Public IP نامعتبر؛ دوباره وارد کن')"; done
+  lp="$(ask 'Public IP of this (IRAN) server' "$(curl -fsSL ifconfig.me 2>/dev/null || echo)")"
+  while ! valid_ip "$lp"; do lp="$(ask 'Invalid IP. Enter IRAN public IP again')"; done
   mtu="$(ask 'VXLAN MTU' "1450")"
 
   install_template
 
-  n="$(ask 'چند سرور خارج می‌خواهی اضافه کنی؟' "1")"
+  n="$(ask 'How many FOREIGN servers to add?' "1")"
   for ((i=1;i<=n;i++)); do
-    bold "— سرور خارج #$i —"
+    bold "-- FOREIGN server #$i --"
     local rp vni port laddr name ifc
-    rp="$(ask 'Public IP سرور خارج')"; while ! valid_ip "$rp"; do rp="$(ask 'IP نامعتبر؛ دوباره')"; done
+    rp="$(ask 'FOREIGN public IP')"; while ! valid_ip "$rp"; do rp="$(ask 'Invalid IP. Enter FOREIGN public IP again')"; done
     vni="$(ask 'VNI' "$((87+i))")"
     port="$(ask 'UDP port' "4789")"
-    laddr="$(ask 'آدرس خصوصی این سرور (ایران) /30' "10.8.$((80+i)).1/30")"
-    while ! valid_cidr30 "$laddr"; do laddr="$(ask 'CIDR /30 نامعتبر؛ نمونه 10.8.88.1/30')"; done
-    name="$(ask 'نام Instance (برای systemd)' "x${i}")"
+    laddr="$(ask 'Private address for IRAN side (/30)' "10.8.$((80+i)).1/30")"
+    while ! valid_cidr30 "$laddr"; do laddr="$(ask 'Invalid /30. Example: 10.8.88.1/30')"; done
+    name="$(ask 'Instance name (systemd)' "x${i}")"
     ifc="vxlan${vni}"
 
     write_conf "$name" "$ifc" "$vni" "$wan" "$lp" "$rp" "$port" "$mtu" "$laddr"
@@ -150,49 +150,50 @@ install_iran_multi() {
     enable_instance "$name"
   done
 
-  if yes_no "قوانین فایروال persist شود؟"; then persist_iptables; fi
-  ok "نصب ایران تمام شد."
+  if yes_no "Persist firewall rules (iptables-persistent)?"; then persist_iptables; fi
+  ok "IRAN installation done."
 }
 
 install_foreign_single() {
-  bold "نصب روی سرور خارج (تک‌به‌تک)"
+  bold "Install on FOREIGN server (single peer with IRAN)"
   local wan lp rp vni port mtu laddr name ifc
   wan="$(default_iface)"; wan="$(ask 'WAN interface' "$wan")"
-  lp="$(ask 'Public IP همین سرور (خارج)' "$(curl -fsSL ifconfig.me 2>/dev/null || echo)")"
-  while ! valid_ip "$lp"; do lp="$(ask 'IP نامعتبر؛ دوباره')"; done
-  rp="$(ask 'Public IP سرور ایران')"; while ! valid_ip "$rp"; do rp="$(ask 'IP نامعتبر؛ دوباره')"; done
+  lp="$(ask 'Public IP of this (FOREIGN) server' "$(curl -fsSL ifconfig.me 2>/dev/null || echo)")"
+  while ! valid_ip "$lp"; do lp="$(ask 'Invalid IP. Enter this FOREIGN public IP again')"; done
+  rp="$(ask 'IRAN public IP')"; while ! valid_ip "$rp"; do rp="$(ask 'Invalid IP. Enter IRAN public IP again')"; done
   vni="$(ask 'VNI' "88")"
   port="$(ask 'UDP port' "4789")"
   mtu="$(ask 'VXLAN MTU' "1450")"
-  laddr="$(ask 'آدرس خصوصی این سرور (خارج) /30' "10.8.88.2/30")"
-  while ! valid_cidr30 "$laddr"; do laddr="$(ask 'CIDR /30 نامعتبر؛ نمونه 10.8.88.2/30')"; done
-  name="$(ask 'نام Instance (برای systemd)' "x1")"
+  laddr="$(ask 'Private address for FOREIGN side (/30)' "10.8.88.2/30")"
+  while ! valid_cidr30 "$laddr"; do laddr="$(ask 'Invalid /30. Example: 10.8.88.2/30')"; done
+  name="$(ask 'Instance name (systemd)' "x1")"
   ifc="vxlan${vni}"
 
   install_template
+  # Note: LOCAL_PUBLIC on FOREIGN is lp; remote is rp (IRAN)
   write_conf "$name" "$ifc" "$vni" "$wan" "$rp" "$lp" "$port" "$mtu" "$laddr"
   allow_udp_from "$rp" "$port"
   enable_instance "$name"
 
-  if yes_no "قوانین فایروال persist شود؟"; then persist_iptables; fi
-  ok "نصب خارج تمام شد."
+  if yes_no "Persist firewall rules (iptables-persistent)?"; then persist_iptables; fi
+  ok "FOREIGN installation done."
 }
 
 add_peer_iran() {
-  bold "افزودن یک سرور خارج جدید (روی ایران)"
+  bold "Add a new FOREIGN peer (on IRAN server)"
   local wan lp
   wan="$(default_iface)"; wan="$(ask 'WAN interface' "$wan")"
-  lp="$(ask 'Public IP ایران' "$(curl -fsSL ifconfig.me 2>/dev/null || echo)")"
-  while ! valid_ip "$lp"; do lp="$(ask 'IP نامعتبر؛ دوباره')"; done
+  lp="$(ask 'IRAN public IP' "$(curl -fsSL ifconfig.me 2>/dev/null || echo)")"
+  while ! valid_ip "$lp"; do lp="$(ask 'Invalid IP. Enter IRAN public IP again')"; done
 
   local rp vni port mtu laddr name ifc
-  rp="$(ask 'Public IP خارج')"; while ! valid_ip "$rp"; do rp="$(ask 'IP نامعتبر؛ دوباره')"; done
+  rp="$(ask 'FOREIGN public IP')"; while ! valid_ip "$rp"; do rp="$(ask 'Invalid IP. Enter FOREIGN public IP again')"; done
   vni="$(ask 'VNI' "99")"
   port="$(ask 'UDP port' "4789")"
   mtu="$(ask 'VXLAN MTU' "1450")"
-  laddr="$(ask 'آدرس خصوصی ایران /30' "10.8.99.1/30")"
-  while ! valid_cidr30 "$laddr"; do laddr="$(ask 'CIDR /30 نامعتبر؛ نمونه 10.8.99.1/30')"; done
-  name="$(ask 'نام Instance' "x$(date +%H%M)")"
+  laddr="$(ask 'Private address for IRAN side (/30)' "10.8.99.1/30")"
+  while ! valid_cidr30 "$laddr"; do laddr="$(ask 'Invalid /30. Example: 10.8.99.1/30')"; done
+  name="$(ask 'Instance name' "x$(date +%H%M)")"
   ifc="vxlan${vni}"
 
   write_conf "$name" "$ifc" "$vni" "$wan" "$lp" "$rp" "$port" "$mtu" "$laddr"
@@ -201,21 +202,21 @@ add_peer_iran() {
 }
 
 remove_peer() {
-  bold "حذف یک Instance"
+  bold "Remove an instance"
   local list; list="$(list_instances)"
-  [ -z "$list" ] && { warn "هیچ کانفیگی پیدا نشد."; return; }
+  [ -z "$list" ] && { warn "No configs found."; return; }
   echo "Instances:"
   echo "$list" | nl -w2 -s'. '
-  local name; name="$(ask 'نام Instance برای حذف')"
+  local name; name="$(ask 'Instance name to remove')"
   disable_instance "$name"
   delete_conf "$name"
   ok "Removed $name"
 }
 
 list_status() {
-  bold "لیست وضعیت"
+  bold "List & status"
   local list; list="$(list_instances)"
-  if [ -z "$list" ]; then warn "چیزی پیدا نشد."; return; fi
+  if [ -z "$list" ]; then warn "No instances."; return; fi
   for n in $list; do
     systemctl is-active "vxlan@$n.service" >/dev/null 2>&1 && s=active || s=inactive
     echo "- $n : $s"
@@ -224,13 +225,13 @@ list_status() {
 }
 
 uninstall_all() {
-  bold "حذف کامل (سرویس‌ها، کانفیگ‌ها)"
+  bold "Full uninstall (services & configs)"
   local list; list="$(list_instances)"
   for n in $list; do disable_instance "$n"; done
   rm -f /etc/systemd/system/vxlan@.service
   rm -rf /etc/vxlan
   systemctl daemon-reload
-  ok "پاکسازی انجام شد."
+  ok "Cleanup done."
 }
 
 # ========= Menu =========
@@ -239,16 +240,16 @@ main_menu() {
   ensure_tools
   while true; do
     echo ""
-    bold "LenaVXLAN Multi-Peer Installer"
-    echo "1) نصب روی ایران (چند خارج)"
-    echo "2) نصب روی خارج (تک‌به‌تک)"
-    echo "3) افزودن یک خارج جدید (ایران)"
-    echo "4) حذف یک Instance"
-    echo "5) لیست و وضعیت"
-    echo "6) Persist فایروال (iptables-persistent)"
-    echo "7) آن‌اینستال کامل"
-    echo "0) خروج"
-    read -rp "انتخاب: " c
+    bold "VXLAN Multi-Peer Installer"
+    echo "1) Install on IRAN server (connect to multiple FOREIGN servers)"
+    echo "2) Install on FOREIGN server (single peer with IRAN)"
+    echo "3) Add a new FOREIGN peer (IRAN)"
+    echo "4) Remove an instance"
+    echo "5) List & status"
+    echo "6) Persist firewall (iptables-persistent)"
+    echo "7) Full uninstall"
+    echo "0) Exit"
+    read -rp "Choose: " c
     case "${c:-}" in
       1) install_iran_multi ;;
       2) install_foreign_single ;;
@@ -258,7 +259,7 @@ main_menu() {
       6) persist_iptables ;;
       7) uninstall_all ;;
       0) exit 0 ;;
-      *) warn "گزینه نامعتبر." ;;
+      *) warn "Invalid option." ;;
     esac
   done
 }
