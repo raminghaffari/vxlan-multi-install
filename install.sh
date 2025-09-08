@@ -166,4 +166,101 @@ install_foreign_single() {
   mtu="$(ask 'VXLAN MTU' "1450")"
   laddr="$(ask 'آدرس خصوصی این سرور (خارج) /30' "10.8.88.2/30")"
   while ! valid_cidr30 "$laddr"; do laddr="$(ask 'CIDR /30 نامعتبر؛ نمونه 10.8.88.2/30')"; done
-  name="$(ask 'نام Instance
+  name="$(ask 'نام Instance (برای systemd)' "x1")"
+  ifc="vxlan${vni}"
+
+  install_template
+  write_conf "$name" "$ifc" "$vni" "$wan" "$rp" "$lp" "$port" "$mtu" "$laddr"
+  allow_udp_from "$rp" "$port"
+  enable_instance "$name"
+
+  if yes_no "قوانین فایروال persist شود؟"; then persist_iptables; fi
+  ok "نصب خارج تمام شد."
+}
+
+add_peer_iran() {
+  bold "افزودن یک سرور خارج جدید (روی ایران)"
+  local wan lp
+  wan="$(default_iface)"; wan="$(ask 'WAN interface' "$wan")"
+  lp="$(ask 'Public IP ایران' "$(curl -fsSL ifconfig.me 2>/dev/null || echo)")"
+  while ! valid_ip "$lp"; do lp="$(ask 'IP نامعتبر؛ دوباره')"; done
+
+  local rp vni port mtu laddr name ifc
+  rp="$(ask 'Public IP خارج')"; while ! valid_ip "$rp"; do rp="$(ask 'IP نامعتبر؛ دوباره')"; done
+  vni="$(ask 'VNI' "99")"
+  port="$(ask 'UDP port' "4789")"
+  mtu="$(ask 'VXLAN MTU' "1450")"
+  laddr="$(ask 'آدرس خصوصی ایران /30' "10.8.99.1/30")"
+  while ! valid_cidr30 "$laddr"; do laddr="$(ask 'CIDR /30 نامعتبر؛ نمونه 10.8.99.1/30')"; done
+  name="$(ask 'نام Instance' "x$(date +%H%M)")"
+  ifc="vxlan${vni}"
+
+  write_conf "$name" "$ifc" "$vni" "$wan" "$lp" "$rp" "$port" "$mtu" "$laddr"
+  allow_udp_from "$rp" "$port"
+  enable_instance "$name"
+}
+
+remove_peer() {
+  bold "حذف یک Instance"
+  local list; list="$(list_instances)"
+  [ -z "$list" ] && { warn "هیچ کانفیگی پیدا نشد."; return; }
+  echo "Instances:"
+  echo "$list" | nl -w2 -s'. '
+  local name; name="$(ask 'نام Instance برای حذف')"
+  disable_instance "$name"
+  delete_conf "$name"
+  ok "Removed $name"
+}
+
+list_status() {
+  bold "لیست وضعیت"
+  local list; list="$(list_instances)"
+  if [ -z "$list" ]; then warn "چیزی پیدا نشد."; return; fi
+  for n in $list; do
+    systemctl is-active "vxlan@$n.service" >/dev/null 2>&1 && s=active || s=inactive
+    echo "- $n : $s"
+    [ -f "/etc/vxlan/$n.conf" ] && awk '{print "   " $0}' "/etc/vxlan/$n.conf"
+  done
+}
+
+uninstall_all() {
+  bold "حذف کامل (سرویس‌ها، کانفیگ‌ها)"
+  local list; list="$(list_instances)"
+  for n in $list; do disable_instance "$n"; done
+  rm -f /etc/systemd/system/vxlan@.service
+  rm -rf /etc/vxlan
+  systemctl daemon-reload
+  ok "پاکسازی انجام شد."
+}
+
+# ========= Menu =========
+main_menu() {
+  require_root
+  ensure_tools
+  while true; do
+    echo ""
+    bold "LenaVXLAN Multi-Peer Installer"
+    echo "1) نصب روی ایران (چند خارج)"
+    echo "2) نصب روی خارج (تک‌به‌تک)"
+    echo "3) افزودن یک خارج جدید (ایران)"
+    echo "4) حذف یک Instance"
+    echo "5) لیست و وضعیت"
+    echo "6) Persist فایروال (iptables-persistent)"
+    echo "7) آن‌اینستال کامل"
+    echo "0) خروج"
+    read -rp "انتخاب: " c
+    case "${c:-}" in
+      1) install_iran_multi ;;
+      2) install_foreign_single ;;
+      3) add_peer_iran ;;
+      4) remove_peer ;;
+      5) list_status ;;
+      6) persist_iptables ;;
+      7) uninstall_all ;;
+      0) exit 0 ;;
+      *) warn "گزینه نامعتبر." ;;
+    esac
+  done
+}
+
+main_menu
