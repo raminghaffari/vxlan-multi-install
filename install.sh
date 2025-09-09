@@ -1,49 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ========== Helpers ==========
-bold() { printf "\e[1m%s\e[0m\n" "$*"; }
-info() { printf "[*] %s\n" "$*"; }
-ok()   { printf "[✓] %s\n" "$*"; }
-warn() { printf "[!] %s\n" "$*"; }
-err()  { printf "[x] %s\n" "$*" >&2; }
+# ===== Helpers =====
+bold(){ printf "\e[1m%s\e[0m\n" "$*"; }
+ok(){ printf "[✓] %s\n" "$*"; }
+warn(){ printf "[!] %s\n" "$*"; }
+err(){ printf "[x] %s\n" "$*" >&2; }
 
-require_root() { [ "$EUID" -eq 0 ] || { err "Run as root."; exit 1; }; }
+require_root(){ [ "$EUID" -eq 0 ] || { err "Run as root."; exit 1; }; }
+default_iface(){ ip route show default | awk '/default/ {print $5; exit}'; }
 
-default_iface() { ip route show default | awk '/default/ {print $5; exit}'; }
-valid_ip() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && ipcalc -cs "$1" >/dev/null 2>&1; }
-valid_cidr30() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/30$ ]]; }
+ask(){ local p="$1" d="${2-}" a; if [ -n "$d" ]; then read -rp "$p [$d]: " a; echo "${a:-$d}"; else read -rp "$p: " a; echo "$a"; fi; }
 
-ask() { # ask "prompt" "default"
-  local p="$1" d="${2-}" a
-  if [ -n "$d" ]; then read -rp "$p [$d]: " a; echo "${a:-$d}"
-  else read -rp "$p: " a; echo "$a"; fi
+valid_ipv4(){
+  local ip=$1 IFS=.
+  [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  read -r a b c d <<<"$ip"
+  for o in $a $b $c $d; do ((o>=0&&o<=255)) || return 1; done
+  return 0
 }
 
-ensure_tools() {
-  if ! command -v ip >/dev/null; then
-    info "Installing iproute2..."
-    apt-get update -y && apt-get install -y iproute2
-  fi
-  if ! command -v iptables >/dev/null; then
-    info "Installing iptables..."
-    apt-get install -y iptables
-  fi
-  if ! command -v ipcalc >/dev/null; then
-    info "Installing ipcalc..."
-    apt-get install -y ipcalc
-  fi
+ensure_tools(){
+  command -v ip >/dev/null || { apt-get update -y && apt-get install -y iproute2; }
+  command -v iptables >/dev/null || apt-get install -y iptables
   systemctl --version >/dev/null || { err "systemd is required."; exit 1; }
 }
 
-yes_no() {
-  local q="$1" a; read -rp "$q [y/N]: " a; [[ "${a,,}" == y* ]]
-}
-
-# ========= systemd Template =========
-install_template() {
-  mkdir -p /etc/vxlan
+install_template(){
   local unit=/etc/systemd/system/vxlan@.service
+  [ -f "$unit" ] && return 0
+  mkdir -p /etc/vxlan
   cat > "$unit" <<'EOF'
 [Unit]
 Description=VXLAN instance %i (point-to-point)
@@ -64,204 +50,232 @@ ExecStop=/usr/sbin/ip link del ${IFACE}
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  ok "systemd template installed: $unit"
+  ok "Installed systemd template."
 }
 
-enable_instance() {
-  local name="$1"
-  systemctl enable --now "vxlan@${name}.service"
-  ok "Enabled vxlan@${name}"
-}
+allow_udp_from(){ local src="$1" port="$2"; iptables -C INPUT -p udp -s "$src" --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp -s "$src" --dport "$port" -j ACCEPT; }
 
-disable_instance() {
-  local name="$1"
-  systemctl disable --now "vxlan@${name}.service" || true
-  ok "Disabled vxlan@${name}"
-}
-
-# ========= Firewall helpers =========
-allow_udp_from() {
-  local src="$1" port="$2"
-  iptables -C INPUT -p udp -s "$src" --dport "$port" -j ACCEPT 2>/dev/null \
-    || iptables -I INPUT -p udp -s "$src" --dport "$port" -j ACCEPT
-}
-
-persist_iptables() {
+persist_rules(){
   if ! dpkg -s iptables-persistent >/dev/null 2>&1; then
-    info "Installing iptables-persistent (optional)..."
     DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent || true
   fi
   netfilter-persistent save || true
-  ok "Firewall rules saved."
+  ok "Firewall rules persisted."
 }
 
-# ========= Config helpers =========
-write_conf() {
-  # args: name iface vni wan local_public remote_public vxport vx_mtu local_addr
-  local name="$1" iface="$2" vni="$3" wan="$4" lp="$5" rp="$6" port="$7" mtu="$8" laddr="$9"
-  cat >"/etc/vxlan/${name}.conf" <<EOF
-IFACE=${iface}
-VNI=${vni}
-WAN_IFACE=${wan}
-LOCAL_PUBLIC=${lp}
-REMOTE_PUBLIC=${rp}
-VXPORT=${port}
-VX_MTU=${mtu}
-LOCAL_ADDR=${laddr}
+# ===== Table utilities =====
+cfg_val(){ awk -F= -v k="$1" '$1==k{print $2}' "$2"; }
+
+list_instances(){ ls -1 /etc/vxlan/*.conf 2>/dev/null | sed 's#.*/##; s#\.conf$##' || true; }
+
+print_table(){
+  local names=(); mapfile -t names < <(list_instances)
+  [ "${#names[@]}" -gt 0 ] || { warn "No instances found."; return 1; }
+  printf "%-3s %-12s %-6s %-9s %-15s %-15s %-15s %-6s %-8s\n" "#" "NAME" "VNI" "IFACE" "LOCAL_PUBLIC" "REMOTE_PUBLIC" "LOCAL_ADDR" "PORT" "STATUS"
+  local i=1 n f vni ifc lp rp la pt st
+  for n in "${names[@]}"; do
+    f="/etc/vxlan/$n.conf"
+    vni=$(cfg_val VNI "$f"); ifc=$(cfg_val IFACE "$f"); lp=$(cfg_val LOCAL_PUBLIC "$f")
+    rp=$(cfg_val REMOTE_PUBLIC "$f"); la=$(cfg_val LOCAL_ADDR "$f"); pt=$(cfg_val VXPORT "$f")
+    systemctl is-active "vxlan@$n" >/dev/null 2>&1 && st=active || st=inactive
+    printf "%-3s %-12s %-6s %-9s %-15s %-15s %-15s %-6s %-8s\n" "$i" "$n" "$vni" "$ifc" "$lp" "$rp" "${la%/*}" "$pt" "$st"
+    i=$((i+1))
+  done
+  return 0
+}
+
+# ===== Peer-IP helper & Connectivity check =====
+get_peer_ip(){ # input: LOCAL_ADDR like 10.8.X.Y/30 -> outputs peer IP (no /cidr)
+  local la="$1" ip="${la%/*}"; IFS=. read -r a b c d <<<"$ip"
+  if [ "$d" = "1" ]; then echo "$a.$b.$c.2"; else echo "$a.$b.$c.1"; fi
+}
+
+run_check(){
+  bold "Connectivity check"
+  local names=(); mapfile -t names < <(list_instances)
+  [ "${#names[@]}" -gt 0 ] || { warn "No instances found."; return; }
+
+  printf "%-12s %-6s %-9s %-15s %-15s %-6s %-8s %-10s %-10s\n" \
+    "NAME" "VNI" "IFACE" "LOCAL_ADDR" "PEER_ADDR" "PORT" "SVC" "PING" "UDP_RX"
+
+  local n f vni ifc la peer rp port svc pingres udprx cnt
+  for n in "${names[@]}"; do
+    f="/etc/vxlan/$n.conf"
+    vni=$(cfg_val VNI "$f")
+    ifc=$(cfg_val IFACE "$f")
+    la=$(cfg_val LOCAL_ADDR "$f")
+    rp=$(cfg_val REMOTE_PUBLIC "$f")
+    port=$(cfg_val VXPORT "$f")
+    peer=$(get_peer_ip "$la")
+
+    systemctl is-active "vxlan@$n" >/dev/null 2>&1 && svc=active || svc=down
+
+    if ping -c1 -W1 "$peer" >/dev/null 2>&1; then pingres=OK; else pingres=FAIL; fi
+
+    cnt=$(iptables -nvL 2>/dev/null | awk -v ip="$rp" -v p="$port" '$0 ~ ip && $0 ~ "udp dpt:"p {print $1; exit}')
+    [ -n "${cnt:-}" ] || cnt=0
+    udprx="$cnt"
+
+    printf "%-12s %-6s %-9s %-15s %-15s %-6s %-8s %-10s %-10s\n" \
+      "$n" "$vni" "$ifc" "${la%/*}" "$peer" "$port" "$svc" "$pingres" "$udprx"
+  done
+
+  echo
+  echo "Legend:"
+  echo "  PING   = reachability over the VXLAN IPs (.1 ↔ .2)."
+  echo "  UDP_RX = number of UDP packets seen on THIS host from REMOTE_PUBLIC to the tunnel port."
+  echo "Hints:"
+  echo "  - PING=FAIL but UDP_RX>0: remote VXLAN/IP config likely wrong."
+  echo "  - UDP_RX=0: VXLAN UDP to this host not arriving (firewall/ISP/port)."
+}
+
+# ===== IRAN mode =====
+run_iran(){
+  bold "IRAN mode (connect to multiple FOREIGN servers)"
+  local WAN_IFACE IR_PUBLIC VX_MTU count
+  WAN_IFACE="$(ask 'WAN interface' "$(default_iface)")"
+  IR_PUBLIC="$(ask 'IRAN public IP' "$(curl -fsSL ifconfig.me 2>/dev/null || true)")"
+  while ! valid_ipv4 "$IR_PUBLIC"; do IR_PUBLIC="$(ask 'Invalid IP, re-enter IRAN public IP')"; done
+  VX_MTU="$(ask 'VXLAN MTU' "1450")"
+  count="$(ask 'How many FOREIGN servers?' "1")"
+  while ! [[ "$count" =~ ^[0-9]+$ ]] || [ "$count" -lt 1 ]; do count="$(ask 'Enter a positive integer')" ; done
+
+  install_template
+
+  printf "\n%-7s %-5s %-16s %-14s %-14s %-7s\n" "Tunnel" "VNI" "Subnet" "IRAN_IP" "FOREIGN_IP" "PORT"
+  for ((i=1;i<=count;i++)); do
+    bold "-- FOREIGN #$i --"
+    local F_PUBLIC VNI PORT SUBNET IR_IP FO_IP IFACE NAME
+    read -rp "FOREIGN public IP: " F_PUBLIC
+    while ! valid_ipv4 "$F_PUBLIC"; do read -rp "Invalid IP. FOREIGN public IP: " F_PUBLIC; done
+
+    VNI=$((87+i))            # 88, 89, ...
+    PORT=$((4788+i))         # 4789, 4790, ...
+    SUBNET="10.8.$VNI.0/30"
+    IR_IP="10.8.$VNI.1/30"
+    FO_IP="10.8.$VNI.2/30"
+    IFACE="vxlan$VNI"
+    NAME="peer$i"
+
+    cat >"/etc/vxlan/${NAME}.conf" <<EOF
+IFACE=${IFACE}
+VNI=${VNI}
+WAN_IFACE=${WAN_IFACE}
+LOCAL_PUBLIC=${IR_PUBLIC}
+REMOTE_PUBLIC=${F_PUBLIC}
+VXPORT=${PORT}
+VX_MTU=${VX_MTU}
+LOCAL_ADDR=${IR_IP}
 EOF
-  ok "Wrote /etc/vxlan/${name}.conf"
-}
-
-delete_conf() {
-  local name="$1"
-  rm -f "/etc/vxlan/${name}.conf"
-  ok "Removed /etc/vxlan/${name}.conf"
-}
-
-list_instances() {
-  ls -1 /etc/vxlan/*.conf 2>/dev/null | sed 's#.*/##; s#\.conf$##' || true
-}
-
-# ========= Actions =========
-install_iran_multi() {
-  bold "Install on IRAN server (connect to multiple FOREIGN servers)"
-  local wan mtu lp n
-  wan="$(default_iface)"; wan="$(ask 'WAN interface' "$wan")"
-  lp="$(ask 'Public IP of this (IRAN) server' "$(curl -fsSL ifconfig.me 2>/dev/null || echo)")"
-  while ! valid_ip "$lp"; do lp="$(ask 'Invalid IP. Enter IRAN public IP again')"; done
-  mtu="$(ask 'VXLAN MTU' "1450")"
-
-  install_template
-
-  n="$(ask 'How many FOREIGN servers to add?' "1")"
-  for ((i=1;i<=n;i++)); do
-    bold "-- FOREIGN server #$i --"
-    local rp vni port laddr name ifc
-    rp="$(ask 'FOREIGN public IP')"; while ! valid_ip "$rp"; do rp="$(ask 'Invalid IP. Enter FOREIGN public IP again')"; done
-    vni="$(ask 'VNI' "$((87+i))")"
-    port="$(ask 'UDP port' "4789")"
-    laddr="$(ask 'Private address for IRAN side (/30)' "10.8.$((80+i)).1/30")"
-    while ! valid_cidr30 "$laddr"; do laddr="$(ask 'Invalid /30. Example: 10.8.88.1/30')"; done
-    name="$(ask 'Instance name (systemd)' "x${i}")"
-    ifc="vxlan${vni}"
-
-    write_conf "$name" "$ifc" "$vni" "$wan" "$lp" "$rp" "$port" "$mtu" "$laddr"
-    allow_udp_from "$rp" "$port"
-    enable_instance "$name"
+    systemctl enable --now "vxlan@${NAME}" >/dev/null || true
+    allow_udp_from "$F_PUBLIC" "$PORT"
+    printf "%-7s %-5s %-16s %-14s %-14s %-7s\n" "$i" "$VNI" "$SUBNET" "${IR_IP%/*}" "${FO_IP%/*}" "$PORT"
   done
 
-  if yes_no "Persist firewall rules (iptables-persistent)?"; then persist_iptables; fi
-  ok "IRAN installation done."
+  if [[ "$(ask 'Persist firewall rules (iptables-persistent)?' 'N')" =~ ^[Yy]$ ]]; then persist_rules; fi
+  ok "IRAN configuration finished."
 }
 
-install_foreign_single() {
-  bold "Install on FOREIGN server (single peer with IRAN)"
-  local wan lp rp vni port mtu laddr name ifc
-  wan="$(default_iface)"; wan="$(ask 'WAN interface' "$wan")"
-  lp="$(ask 'Public IP of this (FOREIGN) server' "$(curl -fsSL ifconfig.me 2>/dev/null || echo)")"
-  while ! valid_ip "$lp"; do lp="$(ask 'Invalid IP. Enter this FOREIGN public IP again')"; done
-  rp="$(ask 'IRAN public IP')"; while ! valid_ip "$rp"; do rp="$(ask 'Invalid IP. Enter IRAN public IP again')"; done
-  vni="$(ask 'VNI' "88")"
-  port="$(ask 'UDP port' "4789")"
-  mtu="$(ask 'VXLAN MTU' "1450")"
-  laddr="$(ask 'Private address for FOREIGN side (/30)' "10.8.88.2/30")"
-  while ! valid_cidr30 "$laddr"; do laddr="$(ask 'Invalid /30. Example: 10.8.88.2/30')"; done
-  name="$(ask 'Instance name (systemd)' "x1")"
-  ifc="vxlan${vni}"
+# ===== FOREIGN mode =====
+run_foreign(){
+  bold "FOREIGN mode (single peer with IRAN)"
+  local WAN_IFACE LOCAL_PUBLIC REMOTE_PUBLIC VNI VXPORT VX_MTU IFACE NAME LOCAL_ADDR
+
+  WAN_IFACE="$(ask 'WAN interface' "$(default_iface)")"
+  LOCAL_PUBLIC="$(ask 'FOREIGN public IP' "$(curl -fsSL ifconfig.me 2>/dev/null || true)")"
+  while ! valid_ipv4 "$LOCAL_PUBLIC"; do LOCAL_PUBLIC="$(ask 'Invalid IP, re-enter FOREIGN public IP')"; done
+  REMOTE_PUBLIC="$(ask 'IRAN public IP')"
+  while ! valid_ipv4 "$REMOTE_PUBLIC"; do REMOTE_PUBLIC="$(ask 'Invalid IP, re-enter IRAN public IP')"; done
+
+  VNI="$(ask 'VNI (from IRAN table, e.g., 88)' "88")"
+  while ! [[ "$VNI" =~ ^[0-9]+$ ]] || [ "$VNI" -lt 1 ] || [ "$VNI" -gt 16777215 ]; do VNI="$(ask 'Invalid VNI. Enter again (1..16777215)')"; done
+
+  VXPORT="$(ask 'UDP port (from IRAN table, e.g., 4789)' "4789")"
+  while ! [[ "$VXPORT" =~ ^[0-9]+$ ]] || [ "$VXPORT" -lt 1 ] || [ "$VXPORT" -gt 65535 ]; do VXPORT="$(ask 'Invalid port. Enter again (1..65535)')"; done
+
+  VX_MTU="$(ask 'VXLAN MTU' "1450")"
+
+  IFACE="vxlan${VNI}"
+  NAME="x${VNI}"
+  LOCAL_ADDR="10.8.${VNI}.2/30"
 
   install_template
-  # Note: LOCAL_PUBLIC on FOREIGN is lp; remote is rp (IRAN)
-  write_conf "$name" "$ifc" "$vni" "$wan" "$rp" "$lp" "$port" "$mtu" "$laddr"
-  allow_udp_from "$rp" "$port"
-  enable_instance "$name"
+  mkdir -p /etc/vxlan
+  cat >"/etc/vxlan/${NAME}.conf" <<EOF
+IFACE=${IFACE}
+VNI=${VNI}
+WAN_IFACE=${WAN_IFACE}
+LOCAL_PUBLIC=${LOCAL_PUBLIC}
+REMOTE_PUBLIC=${REMOTE_PUBLIC}
+VXPORT=${VXPORT}
+VX_MTU=${VX_MTU}
+LOCAL_ADDR=${LOCAL_ADDR}
+EOF
+  systemctl enable --now "vxlan@${NAME}" >/dev/null || true
+  allow_udp_from "$REMOTE_PUBLIC" "$VXPORT"
 
-  if yes_no "Persist firewall rules (iptables-persistent)?"; then persist_iptables; fi
-  ok "FOREIGN installation done."
+  if [[ "$(ask 'Persist firewall rules (iptables-persistent)?' 'N')" =~ ^[Yy]$ ]]; then persist_rules; fi
+  ok "FOREIGN vxlan${VNI} up at ${LOCAL_ADDR}"
+  echo "Test from IRAN: ping 10.8.${VNI}.2"
 }
 
-add_peer_iran() {
-  bold "Add a new FOREIGN peer (on IRAN server)"
-  local wan lp
-  wan="$(default_iface)"; wan="$(ask 'WAN interface' "$wan")"
-  lp="$(ask 'IRAN public IP' "$(curl -fsSL ifconfig.me 2>/dev/null || echo)")"
-  while ! valid_ip "$lp"; do lp="$(ask 'Invalid IP. Enter IRAN public IP again')"; done
-
-  local rp vni port mtu laddr name ifc
-  rp="$(ask 'FOREIGN public IP')"; while ! valid_ip "$rp"; do rp="$(ask 'Invalid IP. Enter FOREIGN public IP again')"; done
-  vni="$(ask 'VNI' "99")"
-  port="$(ask 'UDP port' "4789")"
-  mtu="$(ask 'VXLAN MTU' "1450")"
-  laddr="$(ask 'Private address for IRAN side (/30)' "10.8.99.1/30")"
-  while ! valid_cidr30 "$laddr"; do laddr="$(ask 'Invalid /30. Example: 10.8.99.1/30')"; done
-  name="$(ask 'Instance name' "x$(date +%H%M)")"
-  ifc="vxlan${vni}"
-
-  write_conf "$name" "$ifc" "$vni" "$wan" "$lp" "$rp" "$port" "$mtu" "$laddr"
-  allow_udp_from "$rp" "$port"
-  enable_instance "$name"
-}
-
-remove_peer() {
+# ===== Remove one =====
+run_remove(){
   bold "Remove an instance"
-  local list; list="$(list_instances)"
-  [ -z "$list" ] && { warn "No configs found."; return; }
-  echo "Instances:"
-  echo "$list" | nl -w2 -s'. '
-  local name; name="$(ask 'Instance name to remove')"
-  disable_instance "$name"
-  delete_conf "$name"
-  ok "Removed $name"
+  if ! print_table; then return; fi
+  echo
+  read -rp "Enter instance # or name to remove: " SEL
+  local names=(); mapfile -t names < <(list_instances)
+  [ "${#names[@]}" -gt 0 ] || { warn "No instances."; return; }
+  local NAME=""
+  if [[ "$SEL" =~ ^[0-9]+$ ]] && [ "$SEL" -ge 1 ] && [ "$SEL" -le "${#names[@]}" ]; then
+    NAME="${names[$((SEL-1))]}"
+  else
+    for n in "${names[@]}"; do [ "$n" = "$SEL" ] && NAME="$n" && break; done
+  fi
+  [ -n "$NAME" ] || { err "Invalid selection."; return; }
+  systemctl disable --now "vxlan@${NAME}" || true
+  rm -f "/etc/vxlan/${NAME}.conf"
+  ok "Removed ${NAME}"
 }
 
-list_status() {
-  bold "List & status"
-  local list; list="$(list_instances)"
-  if [ -z "$list" ]; then warn "No instances."; return; fi
-  for n in $list; do
-    systemctl is-active "vxlan@$n.service" >/dev/null 2>&1 && s=active || s=inactive
-    echo "- $n : $s"
-    [ -f "/etc/vxlan/$n.conf" ] && awk '{print "   " $0}' "/etc/vxlan/$n.conf"
+# ===== List =====
+run_list(){ bold "Instances – List & status"; print_table || true; }
+
+# ===== Full uninstall =====
+run_full_uninstall(){
+  bold "Full uninstall – remove ALL tunnels"
+  local names=(); mapfile -t names < <(list_instances)
+  for n in "${names[@]}"; do
+    systemctl disable --now "vxlan@$n" || true
+    rm -f "/etc/vxlan/$n.conf"
   done
-}
-
-uninstall_all() {
-  bold "Full uninstall (services & configs)"
-  local list; list="$(list_instances)"
-  for n in $list; do disable_instance "$n"; done
-  rm -f /etc/systemd/system/vxlan@.service
   rm -rf /etc/vxlan
+  rm -f /etc/systemd/system/vxlan@.service
   systemctl daemon-reload
-  ok "Cleanup done."
+  ok "All VXLAN configs and services removed."
 }
 
-# ========= Menu =========
-main_menu() {
-  require_root
-  ensure_tools
-  while true; do
-    echo ""
-    bold "VXLAN Multi-Peer Installer"
-    echo "1) Install on IRAN server (connect to multiple FOREIGN servers)"
-    echo "2) Install on FOREIGN server (single peer with IRAN)"
-    echo "3) Add a new FOREIGN peer (IRAN)"
-    echo "4) Remove an instance"
-    echo "5) List & status"
-    echo "6) Persist firewall (iptables-persistent)"
-    echo "7) Full uninstall"
-    echo "0) Exit"
-    read -rp "Choose: " c
-    case "${c:-}" in
-      1) install_iran_multi ;;
-      2) install_foreign_single ;;
-      3) add_peer_iran ;;
-      4) remove_peer ;;
-      5) list_status ;;
-      6) persist_iptables ;;
-      7) uninstall_all ;;
-      0) exit 0 ;;
-      *) warn "Invalid option." ;;
-    esac
-  done
-}
+# ===== Main menu =====
+require_root
+ensure_tools
+bold "VXLAN Unified Installer"
+echo "1) IRAN mode (multi FOREIGN)"
+echo "2) FOREIGN mode (single peer)"
+echo "3) Remove an instance"
+echo "4) List & status"
+echo "5) Full uninstall (remove ALL tunnels)"
+echo "6) Connectivity check"
+echo "0) Exit"
+read -rp "Choose: " CH
 
-main_menu
+case "${CH:-}" in
+  1) run_iran ;;
+  2) run_foreign ;;
+  3) run_remove ;;
+  4) run_list ;;
+  5) run_full_uninstall ;;
+  6) run_check ;;
+  0) exit 0 ;;
+  *) err "Invalid option." ;;
+esac
