@@ -149,8 +149,8 @@ run_iran(){
     read -rp "FOREIGN public IP: " F_PUBLIC
     while ! valid_ipv4 "$F_PUBLIC"; do read -rp "Invalid IP. FOREIGN public IP: " F_PUBLIC; done
 
-    VNI=$((87+i))            # 88, 89, ...
-    PORT=$((4788+i))         # 4789, 4790, ...
+    VNI=$((88+i))            # 89, 90, ...
+    PORT=$((4789+i))         # 4790, 4791, ...
     SUBNET="10.8.$VNI.0/30"
     IR_IP="10.8.$VNI.1/30"
     FO_IP="10.8.$VNI.2/30"
@@ -187,10 +187,10 @@ run_foreign(){
   REMOTE_PUBLIC="$(ask 'IRAN public IP')"
   while ! valid_ipv4 "$REMOTE_PUBLIC"; do REMOTE_PUBLIC="$(ask 'Invalid IP, re-enter IRAN public IP')"; done
 
-  VNI="$(ask 'VNI (from IRAN table, e.g., 88)' "88")"
+  VNI="$(ask 'VNI (from IRAN table, e.g., 89)' "89")"
   while ! [[ "$VNI" =~ ^[0-9]+$ ]] || [ "$VNI" -lt 1 ] || [ "$VNI" -gt 16777215 ]; do VNI="$(ask 'Invalid VNI. Enter again (1..16777215)')"; done
 
-  VXPORT="$(ask 'UDP port (from IRAN table, e.g., 4789)' "4789")"
+  VXPORT="$(ask 'UDP port (from IRAN table, e.g., 4790)' "4790")"
   while ! [[ "$VXPORT" =~ ^[0-9]+$ ]] || [ "$VXPORT" -lt 1 ] || [ "$VXPORT" -gt 65535 ]; do VXPORT="$(ask 'Invalid port. Enter again (1..65535)')"; done
 
   VX_MTU="$(ask 'VXLAN MTU' "1450")"
